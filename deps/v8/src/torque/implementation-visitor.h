@@ -10,7 +10,6 @@
 #include "src/base/macros.h"
 #include "src/torque/ast.h"
 #include "src/torque/cfg.h"
-#include "src/torque/file-visitor.h"
 #include "src/torque/global-context.h"
 #include "src/torque/types.h"
 #include "src/torque/utils.h"
@@ -274,11 +273,15 @@ struct Arguments {
 bool IsCompatibleSignature(const Signature& sig, const TypeVector& types,
                            size_t label_count);
 
-class ImplementationVisitor : public FileVisitor {
+class ImplementationVisitor {
  public:
-  void GenerateBuiltinDefinitions(std::string& file_name);
-  void GenerateClassDefinitions(std::string& file_name);
-  void GeneratePrintDefinitions(std::string& file_name);
+  void GenerateBuiltinDefinitions(const std::string& output_directory);
+  void GenerateClassFieldOffsets(const std::string& output_directory);
+  void GeneratePrintDefinitions(const std::string& output_directory);
+  void GenerateClassDefinitions(const std::string& output_directory);
+  void GenerateClassVerifiers(const std::string& output_directory);
+  void GenerateExportedMacrosAssembler(const std::string& output_directory);
+  void GenerateCSATypes(const std::string& output_directory);
 
   VisitResult Visit(Expression* expr);
   const Type* Visit(Statement* stmt);
@@ -326,7 +329,8 @@ class ImplementationVisitor : public FileVisitor {
                           const std::vector<VisitResult>& arguments,
                           const std::vector<Block*> label_blocks);
   void VisitMacroCommon(Macro* macro);
-  void Visit(Macro* macro);
+  void Visit(ExternMacro* macro) {}
+  void Visit(TorqueMacro* macro);
   void Visit(Method* macro);
   void Visit(Builtin* builtin);
   void Visit(NamespaceConstant* decl);
@@ -361,22 +365,23 @@ class ImplementationVisitor : public FileVisitor {
   const Type* Visit(VarDeclarationStatement* stmt);
   const Type* Visit(VarDeclarationStatement* stmt,
                     BlockBindings<LocalValue>* block_bindings);
-  const Type* Visit(ForOfLoopStatement* stmt);
   const Type* Visit(BlockStatement* block);
   const Type* Visit(ExpressionStatement* stmt);
   const Type* Visit(DebugStatement* stmt);
   const Type* Visit(AssertStatement* stmt);
 
-  void BeginNamespaceFile(Namespace* nspace);
-  void EndNamespaceFile(Namespace* nspace);
+  void BeginCSAFiles();
+  void EndCSAFiles();
 
-  void GenerateImplementation(const std::string& dir, Namespace* nspace);
+  void GenerateImplementation(const std::string& dir);
 
   DECLARE_CONTEXTUAL_VARIABLE(ValueBindingsManager,
                               BindingsManager<LocalValue>);
   DECLARE_CONTEXTUAL_VARIABLE(LabelBindingsManager,
                               BindingsManager<LocalLabel>);
   DECLARE_CONTEXTUAL_VARIABLE(CurrentCallable, Callable*);
+  DECLARE_CONTEXTUAL_VARIABLE(CurrentFileStreams,
+                              GlobalContext::PerFileStreams*);
   DECLARE_CONTEXTUAL_VARIABLE(CurrentReturnValue, base::Optional<VisitResult>);
 
   // A BindingsManagersScope has to be active for local bindings to be created.
@@ -386,6 +391,8 @@ class ImplementationVisitor : public FileVisitor {
     ValueBindingsManager::Scope value_bindings_manager;
     LabelBindingsManager::Scope label_bindings_manager;
   };
+
+  void SetDryRun(bool is_dry_run) { is_dry_run_ = is_dry_run; }
 
  private:
   base::Optional<Block*> GetCatchBlock();
@@ -526,7 +533,7 @@ class ImplementationVisitor : public FileVisitor {
   void GenerateBranch(const VisitResult& condition, Block* true_block,
                       Block* false_block);
 
-  typedef std::function<VisitResult()> VisitResultGenerator;
+  using VisitResultGenerator = std::function<VisitResult()>;
   void GenerateExpressionBranch(VisitResultGenerator, Block* true_block,
                                 Block* false_block);
   void GenerateExpressionBranch(Expression* expression, Block* true_block,
@@ -535,11 +542,10 @@ class ImplementationVisitor : public FileVisitor {
   void GenerateMacroFunctionDeclaration(std::ostream& o,
                                         const std::string& macro_prefix,
                                         Macro* macro);
-  void GenerateFunctionDeclaration(std::ostream& o,
-                                   const std::string& macro_prefix,
-                                   const std::string& name,
-                                   const Signature& signature,
-                                   const NameVector& parameter_names);
+  std::vector<std::string> GenerateFunctionDeclaration(
+      std::ostream& o, const std::string& macro_prefix, const std::string& name,
+      const Signature& signature, const NameVector& parameter_names,
+      bool pass_code_assembler_state = true);
 
   VisitResult GenerateImplicitConvert(const Type* destination_type,
                                       VisitResult source);
@@ -548,7 +554,7 @@ class ImplementationVisitor : public FileVisitor {
                                base::Optional<StackRange> arguments = {});
 
   std::vector<Binding<LocalLabel>*> LabelsFromIdentifiers(
-      const std::vector<std::string>& names);
+      const std::vector<Identifier*>& names);
 
   StackRange LowerParameter(const Type* type, const std::string& parameter_name,
                             Stack<std::string>* lowered_parameters);
@@ -562,20 +568,16 @@ class ImplementationVisitor : public FileVisitor {
   std::string ExternalParameterName(const std::string& name);
 
   std::ostream& source_out() {
-    Callable* callable = CurrentCallable::Get();
-    if (!callable || callable->ShouldGenerateExternalCode()) {
-      return CurrentNamespace()->source_stream();
-    } else {
-      return null_stream_;
+    if (auto* streams = CurrentFileStreams::Get()) {
+      return streams->csa_ccfile;
     }
+    return null_stream_;
   }
   std::ostream& header_out() {
-    Callable* callable = CurrentCallable::Get();
-    if (!callable || callable->ShouldGenerateExternalCode()) {
-      return CurrentNamespace()->header_stream();
-    } else {
-      return null_stream_;
+    if (auto* streams = CurrentFileStreams::Get()) {
+      return streams->csa_headerfile;
     }
+    return null_stream_;
   }
   CfgAssembler& assembler() { return *assembler_; }
 
@@ -592,8 +594,14 @@ class ImplementationVisitor : public FileVisitor {
     return return_value;
   }
 
+  void WriteFile(const std::string& file, const std::string& content) {
+    if (is_dry_run_) return;
+    ReplaceFileContentsIfDifferent(file, content);
+  }
+
   base::Optional<CfgAssembler> assembler_;
   NullOStream null_stream_;
+  bool is_dry_run_;
 };
 
 }  // namespace torque
